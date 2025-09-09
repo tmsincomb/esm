@@ -119,6 +119,7 @@ def create_parser():
     )
     parser.add_argument("--cpu-only", help="CPU only", action="store_true")
     parser.add_argument("--cpu-offload", help="Enable CPU offloading", action="store_true")
+    parser.add_argument("--device", help="Device to use (cuda, mps, cpu). If not specified, auto-detects best available.", type=str, default=None)
     return parser
 
 
@@ -146,13 +147,40 @@ def run(args):
     model = model.eval()
     model.set_chunk_size(args.chunk_size)
 
+    # Device selection with MPS support
     if args.cpu_only:
         model.esm.float()  # convert to fp32 as ESM-2 in fp16 is not supported on CPU
         model.cpu()
+        logger.info("Using CPU for inference")
     elif args.cpu_offload:
         model = init_model_on_gpu_with_cpu_offloading(model)
+        logger.info("Using CUDA with CPU offloading")
     else:
-        model.cuda()
+        # Auto-detect or use specified device
+        if args.device:
+            device = torch.device(args.device)
+        else:
+            # Auto-detect best available device
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+        
+        if device.type == "mps":
+            # MPS-specific setup
+            model.esm.float()  # MPS works better with fp32
+            model.to(device)
+            logger.info("Using Apple Metal Performance Shaders (MPS) for inference")
+        elif device.type == "cuda":
+            model.cuda()
+            logger.info("Using CUDA GPU for inference")
+        else:
+            model.esm.float()  # convert to fp32 for CPU
+            model.cpu()
+            logger.info("Using CPU for inference")
+    
     logger.info("Starting Predictions")
     batched_sequences = create_batched_sequence_datasest(all_sequences, args.max_tokens_per_batch)
 
@@ -163,15 +191,17 @@ def run(args):
         try:
             output = model.infer(sequences, num_recycles=args.num_recycles)
         except RuntimeError as e:
-            if e.args[0].startswith("CUDA out of memory"):
+            error_msg = str(e)
+            if "out of memory" in error_msg.lower() or "CUDA out of memory" in error_msg:
+                device_type = "CUDA" if "CUDA" in error_msg else "MPS" if "MPS" in error_msg else "Memory"
                 if len(sequences) > 1:
                     logger.info(
-                        f"Failed (CUDA out of memory) to predict batch of size {len(sequences)}. "
+                        f"Failed ({device_type} out of memory) to predict batch of size {len(sequences)}. "
                         "Try lowering `--max-tokens-per-batch`."
                     )
                 else:
                     logger.info(
-                        f"Failed (CUDA out of memory) on sequence {headers[0]} of length {len(sequences[0])}."
+                        f"Failed ({device_type} out of memory) on sequence {headers[0]} of length {len(sequences[0])}."
                     )
 
                 continue
